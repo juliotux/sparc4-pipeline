@@ -60,6 +60,9 @@ try:
     _HAS_ASTRO = True
 except ImportError:
     _HAS_ASTRO = False
+    OPD_LON = -45.5825
+    OPD_LAT = -22.5344
+    OPD_ALT = 1864.0
 
 CH_COLOR     = {1: "darkblue", 2: "darkgreen", 3: "darkorange", 4: "darkred"}
 CH_BAND      = {1: "g",        2: "r",         3: "i",          4: "z"}
@@ -81,31 +84,22 @@ def _format_time_axis(ax) -> None:
     ax.tick_params(axis="x", which="minor", length=3)
 
 def _sync_xlim(axes_list: list) -> None:
-    """Sync x-axis limits across panels that have real time-series data.
-
-    Ignores empty panels and reference lines (axhline) so their default
-    xlim does not corrupt the shared scale.  Adds a 5-minute margin.
-    """
-    mins, maxs = [], []
+    """Set x-axis limits from the first panel with data, apply to all others."""
+    # Find the first axis that has real plotted data
+    ref_xlim = None
     for ax in axes_list:
-        # Only count lines that have actual time-series data (more than 2 pts
-        # and not a flat reference line added by axhline)
-        data_lines = [
-            line for line in ax.get_lines()
-            if len(line.get_xdata()) > 2
-            and not (line.get_linestyle() in (':', '--', 'dotted', 'dashed')
-                     and len(set(line.get_ydata())) == 1)
-        ]
-        if not data_lines:
-            continue
-        xl = ax.get_xlim()
-        if xl[1] > xl[0]:
-            mins.append(xl[0]); maxs.append(xl[1])
-    if not mins:
+        lines_with_data = [l for l in ax.get_lines()
+                           if len(l.get_xdata()) > 1
+                           and not getattr(l, "_is_twilight", False)]
+        if lines_with_data:
+            ax.relim()
+            ax.autoscale_view(scalex=True, scaley=False)
+            ref_xlim = ax.get_xlim()
+            break
+    if ref_xlim is None:
         return
-    margin = 5 / 60  # 5 minutes in decimal hours
     for ax in axes_list:
-        ax.set_xlim(min(mins) - margin, max(maxs) + margin)
+        ax.set_xlim(ref_xlim)
 
 class _Buf:
     """Circular flux buffer; computes Δmag relative to first measurement."""
@@ -194,7 +188,8 @@ def _load_channel_data(db_path: str, history: int) -> tuple:
                             if abs(jds1[idx] - jd) < 1/86400:
                                 summed_jds.append(jd)
                                 summed_fl.append(f0 + fl1[idx])
-                    data[b0] = (np.array(summed_jds), np.array(summed_fl))                                if summed_jds else (jds0, fl0)
+                    data[b0] = (np.array(summed_jds), np.array(summed_fl)) \
+                               if summed_jds else (jds0, fl0)
                 else:
                     data[b0] = (jds0, fl0)
             target_id = b0_ids[0] if b0_ids else target_id
@@ -230,7 +225,8 @@ def run(host: str, port: int, channels: List[int],
         obs_lon: float = OPD_LON,
         obs_lat: float = OPD_LAT,
         obs_alt: float = OPD_ALT,
-        obs_date: str = "") -> None:
+        obs_date: str = "",
+        save_png: str = "") -> None:
 
     ref_channel = channels[0]
 
@@ -366,6 +362,16 @@ def run(host: str, port: int, channels: List[int],
                         _l._is_twilight = True
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
+        # Save PNG for dashboard if requested
+        if save_png:
+            import pathlib
+            pathlib.Path(save_png).mkdir(parents=True, exist_ok=True)
+            _png = pathlib.Path(save_png) / "raw_lc.png"
+            try:
+                fig.savefig(_png, dpi=110, bbox_inches="tight",
+                            facecolor=fig.get_facecolor())
+            except Exception:
+                pass
 
     # ── Connect xlim_changed callbacks for interactive pan/zoom sync ──────
     # When the user pans or zooms any panel, all other panels follow.
@@ -515,13 +521,16 @@ def main() -> None:
                    help="Observatory altitude m       [default: OPD]")
     g.add_argument("--obs-date",  default="",
                    help="ISO date of the night evening (default: infer from data)")
+    p.add_argument("--save-png", default="",
+                   help="Directory to save PNG for the dashboard")
     opts = p.parse_args()
     channels = [int(c) for c in opts.channels.split(",")]
     run(opts.host, opts.port, channels,
         opts.db or None, opts.history, opts.interval, opts.utc_offset,
         twilight=opts.twilight, night_xlim_flag=opts.night_xlim,
         obs_lon=opts.obs_lon, obs_lat=opts.obs_lat,
-        obs_alt=opts.obs_alt, obs_date=opts.obs_date)
+        obs_alt=opts.obs_alt, obs_date=opts.obs_date,
+        save_png=opts.save_png)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,9 @@ sparc4_plot_saturation.py
 =========================
 SPARC4 real-time saturation monitor — ZeroMQ subscriber.
 
-Tracks peak pixel counts of the target and each comparison star per channel.
-Source assignments (target / comparisons) are read from channel 1's database
-selection table — the single authoritative source for ref_ids that are
-consistent across all four channels.
+Plots peak counts vs local time for the target and each comparison star.
+A horizontal line marks the saturation level. In POLAR mode each beam
+is plotted separately (beam-0 solid, beam-1 dashed).
 
 Usage
 -----
@@ -14,17 +13,6 @@ Usage
 
     python sparc4_plot_saturation.py --db /data/SPARC4/reduced
     python sparc4_plot_saturation.py --host 192.168.1.10 --db /data/SPARC4/reduced
-
-Options
--------
---host HOST         Publisher host                  [default: localhost]
---port PORT         Publisher ZeroMQ port           [default: 5556]
---channels LIST     Comma-separated channel list    [default: 1,2,3,4]
---db DIR            Directory with monitor_chN.db   [default: none]
---sat COUNTS        Saturation warning level (ADU)  [default: 65000]
---history N         Maximum data points shown       [default: 300]
---interval SEC      Plot refresh interval (s)       [default: 2.0]
---utc-offset HOURS  Local UTC offset (e.g. -3)     [default: -3]
 
 Author
 ------
@@ -40,13 +28,12 @@ import os
 import sqlite3
 import time
 from collections import deque
-from typing import Dict, Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import matplotlib.ticker as _mticker
 
 try:
@@ -61,6 +48,9 @@ try:
     _HAS_ASTRO = True
 except ImportError:
     _HAS_ASTRO = False
+    OPD_LON = -45.5825
+    OPD_LAT = -22.5344
+    OPD_ALT = 1864.0
 
 CH_COLOR     = {1: "darkblue", 2: "darkgreen", 3: "darkorange", 4: "darkred"}
 CH_BAND      = {1: "g",        2: "r",         3: "i",          4: "z"}
@@ -83,42 +73,28 @@ def _format_time_axis(ax) -> None:
     ax.tick_params(axis="x", which="minor", length=3)
 
 def _sync_xlim(axes_list: list) -> None:
-    """Sync x-axis limits across panels that have real time-series data.
-
-    Ignores empty panels and reference lines (axhline) so their default
-    xlim does not corrupt the shared scale.  Adds a 5-minute margin.
-    """
-    mins, maxs = [], []
+    """Set x-axis limits from the first panel with data, apply to all others."""
+    ref_xlim = None
     for ax in axes_list:
-        # Only count lines that have actual time-series data (more than 2 pts
-        # and not a flat reference line added by axhline)
-        data_lines = [
-            line for line in ax.get_lines()
-            if len(line.get_xdata()) > 2
-            and not (line.get_linestyle() in (':', '--', 'dotted', 'dashed')
-                     and len(set(line.get_ydata())) == 1)
-        ]
-        if not data_lines:
-            continue
-        xl = ax.get_xlim()
-        if xl[1] > xl[0]:
-            mins.append(xl[0]); maxs.append(xl[1])
-    if not mins:
+        lines_with_data = [l for l in ax.get_lines()
+                           if len(l.get_xdata()) > 1
+                           and not getattr(l, "_is_twilight", False)]
+        if lines_with_data:
+            ax.relim()
+            ax.autoscale_view(scalex=True, scaley=False)
+            ref_xlim = ax.get_xlim()
+            break
+    if ref_xlim is None:
         return
-    margin = 5 / 60  # 5 minutes in decimal hours
     for ax in axes_list:
-        ax.set_xlim(min(mins) - margin, max(maxs) + margin)
+        ax.set_xlim(ref_xlim)
+
 
 def _load_channel_data(db_path: str, history: int) -> tuple:
     """Load selection and peak history from one channel's own DB.
 
-    In POLAR mode, both beam-0 and beam-1 peaks are returned separately
-    so each can be checked for saturation independently.
-
-    Returns (target_id, comp_ids, beam_map,
-             {ref_id: (jd_arr, peak_arr)},
-             {ref_id: (jd_arr, peak_arr)})  — second dict for beam-1 peaks.
-    In PHOT mode the beam-1 dict is empty.
+    In POLAR mode both beam-0 and beam-1 peaks are returned separately.
+    Returns (target_id, comp_ids, beam_map, data_b0, data_b1).
     """
     if not os.path.isfile(db_path):
         return None, [], {}, {}, {}
@@ -132,7 +108,8 @@ def _load_channel_data(db_path: str, history: int) -> tuple:
         for row in sel_rows:
             rid  = row["ref_id"]
             beam = row["beam"]
-            if beam is not None: beam_map[rid] = beam
+            if beam is not None:
+                beam_map[rid] = beam
             if row["role"] == "target": target_id = rid
             else: comp_ids.append(rid)
 
@@ -164,7 +141,7 @@ def _load_channel_data(db_path: str, history: int) -> tuple:
                 b1 = b1_for_b0.get(b0)
                 if b1 is not None:
                     res1 = _fetch_peaks(b1)
-                    if res1: data_b1[b0] = res1  # keyed by b0 for alignment
+                    if res1: data_b1[b0] = res1
             target_id = b0_ids[0] if b0_ids else target_id
             comp_ids  = b0_ids[1:]
         else:
@@ -183,24 +160,25 @@ def _load_channel_data(db_path: str, history: int) -> tuple:
         print(f"  [warn] {db_path}: {exc}")
         return None, [], {}, {}, {}
 
-def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
-        sat_level: float, history: int, interval: float,
-        utc_offset: float,
+
+def run(host: str, port: int, channels: List[int],
+        db_dir: Optional[str], sat_level: float, history: int,
+        interval: float, utc_offset: float,
         twilight: bool = False,
         night_xlim_flag: bool = False,
         obs_lon: float = OPD_LON,
         obs_lat: float = OPD_LAT,
         obs_alt: float = OPD_ALT,
-        obs_date: str = "") -> None:
+        obs_date: str = "",
+        save_png: str = "") -> None:
 
-    nch        = len(channels)
-    ref_channel = channels[0]   # authoritative ref_id namespace
+    ref_channel = channels[0]
 
     # Per-channel selections — each channel has its own ref_ids
     per_ch_target: Dict[int, Optional[int]] = {ch: None for ch in channels}
     per_ch_comps:  Dict[int, List[int]]     = {ch: []   for ch in channels}
 
-    # Buffers keyed by (ref_id, beam) where beam is 0/1 (POLAR) or 0 (PHOT)
+    # Buffers keyed by (ref_id, beam): 0=ordinary, 1=extraordinary
     bufs:      Dict[int, Dict] = {ch: {} for ch in channels}
     peak_bufs: Dict[int, Dict] = {ch: {} for ch in channels}
 
@@ -210,7 +188,6 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
             bufs[ch][key]      = deque(maxlen=history)
             peak_bufs[ch][key] = deque(maxlen=history)
 
-    # Pre-load from DB
     if db_dir:
         print("[sat] Loading historical data...")
         for ch in channels:
@@ -227,7 +204,6 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
                 bufs[ch][(rid, 1)].extend(jds)
                 peak_bufs[ch][(rid, 1)].extend(peaks)
 
-    # ZeroMQ
     ctx  = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{host}:{port}")
@@ -236,35 +212,39 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
     sock.setsockopt(zmq.RCVTIMEO, int(interval * 1000))
     print(f"[sat] Subscribed  tcp://{host}:{port}  ch={channels}")
 
-    # Figure
-    panel_h = min(2.8, 8.5 / nch)
-    fig = plt.figure(figsize=(13, panel_h * nch))
+    nch     = len(channels)
+    panel_h = min(3.5, 12.0 / nch)
+    fig, axs = plt.subplots(nch, 1, figsize=(13, panel_h * nch), squeeze=False)
+    axes: Dict[int, plt.Axes] = {ch: axs[i][0] for i, ch in enumerate(channels)}
+
     fig.patch.set_facecolor("white")
-    fig.canvas.manager.set_window_title("SPARC4 — Saturation Monitor")
-    gs = gridspec.GridSpec(nch, 1, hspace=0.42,
-                           left=0.09, right=0.97, top=0.93, bottom=0.09)
-    axes: Dict[int, plt.Axes] = {}
+    fig.suptitle(f"SPARC4  —  Peak Counts  (sat={sat_level:.0f})",
+                 fontsize=14, fontweight="bold", color="black", y=0.99)
+    try:
+        fig.canvas.manager.set_window_title("SPARC4 — Saturation")
+    except Exception:
+        pass
+
     for idx, ch in enumerate(channels):
-        ax = fig.add_subplot(gs[idx])
-        axes[ch] = ax
+        ax = axes[ch]
         ax.set_facecolor("white")
-        ax.set_ylabel("Peak counts  (ADU)", fontsize=12)
-        ax.grid(True, color="lightgray", ls="--", lw=0.6)
-        for spine in ax.spines.values(): spine.set_edgecolor("gray")
-        ax.tick_params(colors="black", labelsize=11)
-        ax.axhline(sat_level,       color="darkred",    lw=1.4, ls="--",
+        ax.set_ylabel("Peak (ADU)", fontsize=12)
+        ax.axhline(sat_level,       color="darkred",   lw=1.4, ls="--",
                    label=f"Saturation ({sat_level:.0f})")
         ax.axhline(sat_level * 0.7, color="darkorange", lw=1.0, ls=":",
                    label=f"70%  ({sat_level*0.7:.0f})")
         ax.set_ylim(0, sat_level * 1.15)
+        ax.grid(True, color="lightgray", ls="--", lw=0.6)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("gray")
+        ax.tick_params(colors="black", labelsize=11)
         ax.set_title(f"{CH_BAND[ch]}  (ch{ch})", fontsize=12,
                      fontweight="bold", color=CH_COLOR[ch], loc="left")
         _format_time_axis(ax)
         if idx == nch - 1:
             ax.set_xlabel(f"Local time  (UTC{utc_offset:+.0f}h)", fontsize=12)
 
-    fig.suptitle("SPARC4  —  Peak Counts  (Target + Comparisons)",
-                 fontsize=13, fontweight="bold", color="black")
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
 
     lines: Dict[int, Dict] = {ch: {} for ch in channels}
     last_draw = 0.0
@@ -288,14 +268,13 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
 
             latest = []
             for rid in ordered:
-                # In POLAR mode plot each beam separately
                 beams_present = [b for b in (0, 1)
                                  if (rid, b) in bufs[ch]
                                  and len(bufs[ch][(rid, b)]) > 0]
                 if not beams_present:
                     continue
                 for b in beams_present:
-                    key  = (rid, b)
+                    key   = (rid, b)
                     jds   = np.array(bufs[ch][key])
                     peaks = np.array(peak_bufs[ch][key])
                     ht    = _jd_to_hours(jds, utc_offset)
@@ -307,7 +286,7 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
                         mfc = TARGET_COLOR
                         lbl = f"Target{beam_sfx}  (src {rid})"
                     else:
-                        ci  = cids.index(rid)
+                        ci  = cids.index(rid) if rid in cids else 0
                         col = COMP_COLORS[ci % len(COMP_COLORS)]
                         marker, lw, ms, mfc = "s", 1.5, 5, "white"
                         lbl = f"C{ci+1}{beam_sfx}  (src {rid})"
@@ -324,15 +303,15 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
                         lines[ch][line_key].set_data(ht, peaks)
 
                     if len(peaks):
-                        pk = float(peaks[-1])
-                        warn = "⚠" if pk >= sat_level else ""
-                        pfx  = "T" if is_target else f"C{cids.index(rid)+1}"
+                        pk   = float(peaks[-1])
+                        warn = " ⚠SAT" if pk >= sat_level else ""
+                        pfx  = "T" if is_target else f"C{cids.index(rid)+1 if rid in cids else 0}"
                         latest.append(f"{pfx}B{b}={pk:.0f}{warn}")
 
-            ax.relim(); ax.autoscale_view(scalex=True, scaley=False)
+            ax.relim(); ax.autoscale_view(scaley=False)
             handles, lbls = ax.get_legend_handles_labels()
             if handles:
-                ax.legend(handles, lbls, loc="upper left", fontsize=10,
+                ax.legend(handles, lbls, loc="upper left", fontsize=9,
                           framealpha=0.9, edgecolor="gray")
             suffix = ("  |  " + "  ".join(latest)) if latest else ""
             ax.set_title(f"{CH_BAND[ch]}  (ch{ch}){suffix}",
@@ -345,24 +324,29 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
                 for _l in list(_ax.get_lines()):
                     if getattr(_l, "_is_twilight", False):
                         _l.remove()
-            add_twilight_lines(list(axes.values()), sun_evts,
-                               legend_ax_index=0)
+            add_twilight_lines(list(axes.values()), sun_evts, legend_ax_index=0)
             for _ax in axes.values():
                 for _l in _ax.get_lines():
-                    if _l.get_label() in ("Sunset","Sunrise",
-                        "Civil twil.","Nautical twil.","Astron. twil."):
+                    if _l.get_label() in ("Sunset", "Sunrise",
+                        "Civil twil.", "Nautical twil.", "Astron. twil."):
                         _l._is_twilight = True
+
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
+        if save_png:
+            import pathlib
+            pathlib.Path(save_png).mkdir(parents=True, exist_ok=True)
+            try:
+                fig.savefig(str(pathlib.Path(save_png) / "saturation.png"),
+                            dpi=110, bbox_inches="tight",
+                            facecolor=fig.get_facecolor())
+            except Exception:
+                pass
 
-    # ── Connect xlim_changed callbacks for interactive pan/zoom sync ──────
-    # When the user pans or zooms any panel, all other panels follow.
-    # The _syncing guard prevents infinite callback recursion.
+    # Connect xlim_changed callbacks for interactive pan/zoom sync
     _syncing = [False]
-
     def _on_xlim_changed(ax_changed):
-        if _syncing[0]:
-            return
+        if _syncing[0]: return
         _syncing[0] = True
         try:
             xl = ax_changed.get_xlim()
@@ -372,24 +356,21 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
             fig.canvas.draw_idle()
         finally:
             _syncing[0] = False
-
     for _ax in axes.values():
         _ax.callbacks.connect("xlim_changed", _on_xlim_changed)
 
-    # ── Sun events / twilight ─────────────────────────────────────────────
+    # Sun events
     sun_evts = None
     if _HAS_ASTRO and (twilight or night_xlim_flag):
         _jd0 = next(
             (jd for ch_bufs in bufs.values()
-             for buf in ch_bufs.values()
-             for jd in (list(buf.jd) if hasattr(buf, "jd") else list(buf))
-             if np.isfinite(jd)), None)
+             for dq in ch_bufs.values()
+             for jd in dq if np.isfinite(jd)), None)
         _date = obs_date or (date_from_jd(_jd0, utc_offset) if _jd0 else "")
         if not _date:
             from datetime import date as _d
             _date = _d.today().isoformat()
-        sun_evts = compute_sun_events(
-            _date, obs_lon, obs_lat, obs_alt, utc_offset)
+        sun_evts = compute_sun_events(_date, obs_lon, obs_lat, obs_alt, utc_offset)
         if night_xlim_flag and sun_evts is not None:
             xlo, xhi = night_xlim(sun_evts)
             if xlo is not None:
@@ -429,32 +410,29 @@ def run(host: str, port: int, channels: List[int], db_dir: Optional[str],
             tid  = per_ch_target[ch]
             cids = per_ch_comps[ch]
 
-            # Store peak per source per beam.
+            # Store peak per source per beam
             for s in sources:
                 rid  = s.get("ref_id")
                 pk   = s.get("peak")
-                beam = s.get("beam")  # 0, 1, or None
+                beam = s.get("beam")
                 if rid is None or pk is None: continue
                 b = beam if beam is not None else 0
                 _ensure(ch, rid, beam=b)
-                bufs[ch][(rid, b)].append(jd)
+                bufs[ch][(rid, b)].append(float(jd))
                 peak_bufs[ch][(rid, b)].append(float(pk))
             new_data = True
 
             if tid is not None:
-                track = [tid] + [r for r in cids if r != tid]
-                # Build a peak lookup from the buffers just updated
                 def _last_peak(rid):
                     for b in (0, 1):
                         pk_dq = peak_bufs[ch].get((rid, b))
-                        if pk_dq:
-                            return float(pk_dq[-1])
+                        if pk_dq: return float(pk_dq[-1])
                     return 0.0
-                pstr = "  ".join(
+                track = [tid] + [r for r in cids if r != tid]
+                pstr  = "  ".join(
                     [f"T={_last_peak(track[0]):.0f}"] +
                     [f"C{i}={_last_peak(r):.0f}"
-                     for i,r in enumerate(track[1:],1)]
-                )
+                     for i, r in enumerate(track[1:], 1)])
                 warn = "  ⚠SAT" if any(
                     _last_peak(r) >= sat_level for r in track) else ""
                 print(f"  ch{ch} ({CH_BAND[ch]})  {pstr}{warn}")
@@ -487,26 +465,24 @@ def main() -> None:
     p.add_argument("--interval",   type=float, default=2.0)
     p.add_argument("--utc-offset", type=float, default=-3.0)
     g = p.add_argument_group("Night / twilight options")
-    g.add_argument("--twilight", action="store_true",
-                   help="Draw sunset/sunrise and twilight vertical lines")
-    g.add_argument("--night-xlim", action="store_true",
-                   help="Fix x-axis from sunset to sunrise of the current night")
-    g.add_argument("--obs-lon",   type=float, default=OPD_LON,
-                   help="Observatory longitude deg E  [default: OPD]")
-    g.add_argument("--obs-lat",   type=float, default=OPD_LAT,
-                   help="Observatory latitude deg N   [default: OPD]")
-    g.add_argument("--obs-alt",   type=float, default=OPD_ALT,
-                   help="Observatory altitude m       [default: OPD]")
-    g.add_argument("--obs-date",  default="",
-                   help="ISO date of the night evening (default: infer from data)")
-    opts = p.parse_args()
+    g.add_argument("--twilight",   action="store_true")
+    g.add_argument("--night-xlim", action="store_true")
+    g.add_argument("--obs-lon",    type=float, default=OPD_LON)
+    g.add_argument("--obs-lat",    type=float, default=OPD_LAT)
+    g.add_argument("--obs-alt",    type=float, default=OPD_ALT)
+    g.add_argument("--obs-date",   default="")
+    p.add_argument("--save-png",   default="",
+                   help="Directory to save PNG for the dashboard")
+    opts     = p.parse_args()
     channels = [int(c) for c in opts.channels.split(",")]
     run(opts.host, opts.port, channels,
         opts.db or None, opts.sat, opts.history,
         opts.interval, opts.utc_offset,
-        twilight=opts.twilight, night_xlim_flag=opts.night_xlim,
+        twilight=opts.twilight,
+        night_xlim_flag=opts.night_xlim,
         obs_lon=opts.obs_lon, obs_lat=opts.obs_lat,
-        obs_alt=opts.obs_alt, obs_date=opts.obs_date)
+        obs_alt=opts.obs_alt, obs_date=opts.obs_date,
+        save_png=opts.save_png)
 
 
 if __name__ == "__main__":

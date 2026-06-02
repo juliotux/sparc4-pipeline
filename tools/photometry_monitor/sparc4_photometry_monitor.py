@@ -847,6 +847,18 @@ def measure_raw_photometry(
     else:
         fwhm_y_err = float(mfwhm_y * 0.10)
 
+    # Sort all per-source arrays by flux descending so ref_id 0 is always
+    # the brightest detected source, ref_id 1 the second brightest, etc.
+    _fl = np.asarray(fluxes, dtype=float)
+    _sort = np.argsort(_fl)[::-1]
+    _xc      = np.asarray(xc,       dtype=float)[_sort]
+    _yc      = np.asarray(yc,       dtype=float)[_sort]
+    _fl      = _fl[_sort]
+    _flerr   = np.asarray(fluxerrs, dtype=float)[_sort]
+    _peak    = np.asarray(ap_peak,  dtype=float)[_sort]
+    _fwhms_x = np.asarray(fwhms_x,  dtype=float)[_sort]
+    _fwhms_y = np.asarray(fwhms_y,  dtype=float)[_sort]
+
     return {
         "date_obs":    hdr[time_key],
         "jd":          float(obstime.jd),
@@ -858,14 +870,14 @@ def measure_raw_photometry(
         "fwhm_err":    float(np.sqrt(fwhm_x_err**2 + fwhm_y_err**2)),
         "fwhm_x_err":  fwhm_x_err,
         "fwhm_y_err":  fwhm_y_err,
-        "fwhms_x":     fwhms_x,
-        "fwhms_y":     fwhms_y,
+        "fwhms_x":     _fwhms_x,
+        "fwhms_y":     _fwhms_y,
         "n_sources":   len(sources),
-        "xcentroids":  np.asarray(xc, dtype=float),
-        "ycentroids":  np.asarray(yc, dtype=float),
-        "fluxes":      np.asarray(fluxes,   dtype=float),
-        "fluxerrs":    np.asarray(fluxerrs, dtype=float),
-        "max_counts":  np.asarray(ap_peak,       dtype=float),
+        "xcentroids":  _xc,
+        "ycentroids":  _yc,
+        "fluxes":      _fl,
+        "fluxerrs":    _flerr,
+        "max_counts":  _peak,
         "sky_median":  float(np.nanmedian(sky_per_px)),
         "sky_rms":     float(np.nanmedian(sky_err_per_px)),
     }
@@ -891,6 +903,7 @@ def select_sources_interactive(
     ref_result:   dict,
     platescale:   float = 0.335,
     all_channel_data: Optional[Dict[int, tuple]] = None,
+    save_png_dir: str = "",
 ) -> Tuple[Optional[int], List[int], Dict[int, Optional[int]], Dict[int, List[int]]]:
     """Four-panel interactive source selection across all available channels.
 
@@ -987,7 +1000,7 @@ def select_sources_interactive(
 
     # ── Figure ────────────────────────────────────────────────────────────
     fig, axs = plt.subplots(nrows, ncols,
-                             figsize=(min(8 * ncols, 20), min(7 * nrows, 18)),
+                             figsize=(min(9 * ncols, 22), min(8 * nrows, 20)),
                              squeeze=False)
     fig.patch.set_facecolor("black")
     if is_polar:
@@ -1292,14 +1305,29 @@ def select_sources_interactive(
     def _close(event):
         done[0] = True
 
+    def _save_fig_on_close(event):
+        if save_png_dir:
+            import pathlib as _pl2
+            _out = _pl2.Path(save_png_dir)
+            _out.mkdir(parents=True, exist_ok=True)
+            try:
+                fig.savefig(str(_out / "selection.png"), dpi=110,
+                            bbox_inches="tight",
+                            facecolor=fig.get_facecolor())
+                print("[monitor] Selection PNG saved.")
+            except Exception as _exc:
+                print(f"[monitor] Could not save selection PNG: {_exc}")
+
     fig.canvas.mpl_connect("button_press_event", _click)
     fig.canvas.mpl_connect("key_press_event",    _key)
     fig.canvas.mpl_connect("close_event",        _close)
+    fig.canvas.mpl_connect("close_event",        _save_fig_on_close)
     # Use subplots_adjust instead of tight_layout to prevent the
     # window manager from resizing the window to a small size.
     fig.subplots_adjust(left=0.04, right=0.98, top=0.88,
                         bottom=0.03, wspace=0.06, hspace=0.08)
-    # Maximise the window before showing — works on TkAgg / Qt5Agg
+    # Resize to a large but windowed size — avoids full-screen on VNC/Linux
+    # where full_screen_toggle() produces an uncloseable window.
     try:
         mgr = plt.get_current_fig_manager()
         try:
@@ -1478,8 +1506,424 @@ def _publish(sock, channel: int, result: dict, ref_ids: np.ndarray,
     sock.send_multipart([topic, json.dumps(payload).encode()])
 
 
+def _save_auto_selection_png(filepath: str, result: dict,
+                              target_id: int, comp_ids: list,
+                              save_dir: str,
+                              polar_mode: bool = False) -> None:
+    """Save the auto-selection as a 4-panel PNG without showing any window.
+
+    Uses matplotlib.figure.Figure directly (no pyplot) so no GUI window
+    is ever created.  One panel per channel; channels 2-4 use the same
+    reference image (filepath) since we only have ch1 at this point —
+    the image is annotated to indicate which channel it represents.
+    In POLAR mode, beam pairs are shown with matching colours.
+    """
+    import pathlib
+    import matplotlib.figure
+    import matplotlib.patches as mpatches
+    import matplotlib.patheffects as pe
+    from astropy.stats import SigmaClip
+    from photutils.background import Background2D, MedianBackground
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    out = pathlib.Path(save_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    xs = np.asarray(result.get("xcentroids", []))
+    ys = np.asarray(result.get("ycentroids", []))
+
+    try:
+        ext = 1 if filepath.endswith(".fits.fz") else 0
+        with fits.open(filepath) as hdul:
+            img = np.array(hdul[ext].data, dtype=float)
+        bkg = Background2D(img, (50, 50), filter_size=(5, 5),
+                           sigma_clip=SigmaClip(sigma=3.0),
+                           bkg_estimator=MedianBackground())
+        sub  = img - bkg.background
+        vmin = float(np.nanpercentile(sub,  1))
+        vmax = float(np.nanpercentile(sub, 99))
+    except Exception as exc:
+        print(f"[monitor] _save_auto_selection_png: image load failed: {exc}")
+        return
+
+    CH_BAND = {1: "g", 2: "r", 3: "i", 4: "z"}
+    CH_COL  = {1: "darkblue", 2: "darkgreen", 3: "darkorange", 4: "darkred"}
+
+    fig = matplotlib.figure.Figure(figsize=(18, 16), facecolor="black")
+
+    def _draw_panel(ax, ch_label, band_label, col):
+        ax.set_facecolor("black")
+        ax.imshow(sub, origin="lower", cmap="gray",
+                  vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"ch{ch_label}  —  {band_label} band  "
+                     f"(auto-selection, ref frame)",
+                     color="white", fontsize=11, fontweight="bold")
+        for spine in ax.spines.values():
+            spine.set_edgecolor(col)
+            spine.set_linewidth(2)
+
+        if polar_mode:
+            # Pairs: (target_b0, target_b1), (c1_b0, c1_b1), ...
+            # comp_ids are beam-0 IDs; beam-1 = beam-0 + 1
+            pairs = [(target_id, target_id + 1)] +                     [(c, c + 1) for c in comp_ids]
+            for pair_rank, (b0, b1) in enumerate(pairs):
+                pcol  = "lime" if pair_rank == 0 else "red"
+                label = "Target" if pair_rank == 0 else f"C{pair_rank}"
+                for beam, rid in enumerate((b0, b1)):
+                    if rid < 0 or rid >= len(xs):
+                        continue
+                    beam_lbl = f"{label} B{beam}"
+                    ax.add_patch(mpatches.Circle(
+                        (xs[rid], ys[rid]), radius=18,
+                        lw=2.5, edgecolor=pcol, facecolor="none", zorder=4))
+                    ax.text(xs[rid] + 20, ys[rid] + 20, beam_lbl,
+                            color=pcol, fontsize=10, fontweight="bold", zorder=6,
+                            path_effects=[pe.withStroke(linewidth=2,
+                                                        foreground="black")])
+        else:
+            for rank, rid in enumerate([target_id] + list(comp_ids)):
+                if rid < 0 or rid >= len(xs):
+                    continue
+                pcol  = "lime" if rank == 0 else "red"
+                label = "Target" if rank == 0 else f"C{rank}"
+                ax.add_patch(mpatches.Circle(
+                    (xs[rid], ys[rid]), radius=18,
+                    lw=2.5, edgecolor=pcol, facecolor="none", zorder=4))
+                ax.text(xs[rid] + 20, ys[rid] + 20, label,
+                        color=pcol, fontsize=10, fontweight="bold", zorder=6,
+                        path_effects=[pe.withStroke(linewidth=2,
+                                                    foreground="black")])
+
+    for idx, ch in enumerate([1, 2, 3, 4]):
+        row, col_idx = divmod(idx, 2)
+        ax = fig.add_subplot(2, 2, idx + 1)
+        band = CH_BAND.get(ch, "?")
+        _draw_panel(ax, ch, band, CH_COL.get(ch, "white"))
+
+    fname = os.path.basename(filepath)
+    fig.suptitle(f"Auto-selection  —  {fname}",
+                 color="white", fontsize=13, fontweight="bold")
+    fig.subplots_adjust(left=0.04, right=0.98, top=0.93,
+                        bottom=0.03, wspace=0.05, hspace=0.1)
+    png_path = out / "selection.png"
+    FigureCanvasAgg(fig).print_figure(str(png_path), dpi=110)
+    print(f"[monitor] Auto-selection PNG saved to {png_path}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main monitoring loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MonitorState — holds all mutable state for one monitoring session
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MonitorState:
+    """All mutable state for a monitoring session, passed explicitly."""
+
+    def __init__(self, channels: list):
+        self.channels        = channels
+        self.dbs:            Dict[int, PhotometryDB]    = {}
+        self.matchers:       Dict[int, SourceMatcher]   = {}
+        self.sock            = None                    # ZMQ socket
+
+        # Selection results
+        self.target_ref_id:  Optional[int]             = None
+        self.comp_ref_ids:   List[int]                 = []
+        self.per_ch_target:  Dict[int, Optional[int]]  = {ch: None for ch in channels}
+        self.per_ch_comps:   Dict[int, List[int]]      = {ch: []   for ch in channels}
+        self.selection_done: bool                      = False
+
+        # Interactive-mode only
+        self.sel_xy:         Dict[int, list]           = {}
+        self.polar_mode:     bool                      = False
+        self.ch_beam_offsets:Dict[int, Optional[tuple]]= {ch: None for ch in channels}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level helper functions — all take MonitorState explicitly
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _auto_select(st: MonitorState, ref_filepath: str, ref_result: dict,
+                 n_sources: int, save_png: str) -> None:
+    """Pick the top-N brightest sources automatically (no window).
+
+    PHOT mode: selects n_sources individual sources.
+               ref_ids: target=0, comps=[1, 2, ..., n_sources-1]
+
+    POLAR mode: selects n_sources beam-pairs (consecutive pairs from the
+                flux-sorted list). Each pair shares the same physical star.
+               ref_ids: target_b0=0, target_b1=1, comp1_b0=2, comp1_b1=3, ...
+               Only beam-0 ref_ids are stored as target/comp identifiers;
+               beam-1 partners are stored with beam labels in the DB.
+    """
+    if st.selection_done:
+        return
+
+    inst_mode = ref_result.get("inst_mode", "PHOT").upper()
+    is_polar  = (inst_mode == "POLAR")
+    n_cat     = len(ref_result.get("xcentroids", []))
+
+    if is_polar:
+        # Need 2*n_sources individual detections to form n_sources pairs
+        n_pairs   = n_sources
+        n_needed  = n_pairs * 2
+        n_avail   = (n_cat // 2)          # max complete pairs available
+        n_pairs   = min(n_pairs, n_avail)
+        if n_pairs < 1:
+            print("[monitor] Auto-select (POLAR): not enough sources — will retry")
+            return
+        # Pairs: (0,1), (2,3), (4,5), ...
+        beam_map: dict = {}
+        all_sel_ids: list = []   # b0, b1, b0, b1, ... in role order
+        b0_ids: list = []
+        for k in range(n_pairs):
+            b0 = k * 2
+            b1 = k * 2 + 1
+            b0_ids.append(b0)
+            all_sel_ids += [b0, b1]
+            beam_map[b0] = 0
+            beam_map[b1] = 1
+        t_id  = b0_ids[0]
+        c_ids = b0_ids[1:]            # beam-0 IDs of comps
+        # Save to DB with beam labels (target row + all beam-0/1 comp rows)
+        for ch in st.channels:
+            st.per_ch_target[ch] = t_id
+            st.per_ch_comps[ch]  = c_ids
+            # save_selection stores target + all_sel_ids[1:] with beam_map
+            st.dbs[ch].save_selection(t_id, all_sel_ids[1:], beam_map=beam_map)
+        st.target_ref_id = t_id
+        st.comp_ref_ids  = c_ids
+        st.polar_mode    = True
+        st.selection_done = True
+        print(f"[monitor] Auto-selected (POLAR): target_b0={t_id}  "
+              f"comps_b0={c_ids}  beam_map={beam_map}  "
+              f"({n_pairs} pairs from {n_cat} sources)")
+    else:
+        n_pick = min(n_sources, n_cat)
+        if n_pick < 1:
+            print("[monitor] Auto-select: no sources detected — will retry")
+            return
+        t_id  = 0
+        c_ids = list(range(1, n_pick))
+        for ch in st.channels:
+            st.per_ch_target[ch] = t_id
+            st.per_ch_comps[ch]  = c_ids
+            st.dbs[ch].save_selection(t_id, c_ids)
+        st.target_ref_id  = t_id
+        st.comp_ref_ids   = c_ids
+        st.selection_done = True
+        print(f"[monitor] Auto-selected (PHOT): target={t_id}  comps={c_ids}  "
+              f"({n_pick}/{n_cat} sources)")
+
+    if save_png:
+        _save_auto_selection_png(ref_filepath, ref_result,
+                                 st.target_ref_id, st.comp_ref_ids,
+                                 save_png, st.polar_mode)
+
+
+def _interactive_select(st: MonitorState, ref_filepath: str, ref_result: dict,
+                        data_dirs: dict, seq_suffix: str, object_filter,
+                        threshold: float, fwhm_estimate: float,
+                        aperture_radius: float, window_size: int,
+                        platescale: float, save_png: str) -> None:
+    """Open the 4-panel selection window and store pixel coords."""
+    if st.selection_done:
+        return
+
+    # Collect nearest-in-time frame for every channel
+    ref_jd = ref_result.get("jd", float("nan"))
+    all_channel_data: Dict[int, tuple] = {}
+    for ch in st.channels:
+        files = find_fits_files(data_dirs[ch], seq_suffix, object_filter)
+        if not files:
+            continue
+        best_fp, best_dt = None, float("inf")
+        for fp in files:
+            jd = _get_jd_from_header(fp)
+            dt = abs(jd - ref_jd)
+            if dt < best_dt:
+                best_dt, best_fp = dt, fp
+        if best_fp is None:
+            continue
+        try:
+            res = measure_raw_photometry(
+                best_fp, threshold=threshold,
+                fwhm_for_detection=fwhm_estimate,
+                aperture_radius=aperture_radius,
+                window_size=window_size, verbose=False,
+            )
+            if res["n_sources"] > 0:
+                all_channel_data[ch] = (best_fp, res)
+                print(f"  [selection] ch{ch}: {os.path.basename(best_fp)} "
+                      f"(dt={best_dt*86400:.0f} s,  {res['n_sources']} sources)")
+        except Exception as exc:
+            print(f"  [warn] ch{ch} selection frame: {exc}")
+
+    all_channel_data[st.channels[0]] = (ref_filepath, ref_result)
+
+    per_ch_sel_xy, sel_inst_mode, sel_beam_offsets = \
+        select_sources_interactive(
+            ref_filepath, ref_result,
+            platescale=platescale,
+            all_channel_data=all_channel_data,
+            save_png_dir=save_png,
+        )
+    st.sel_xy          = per_ch_sel_xy
+    st.polar_mode      = (sel_inst_mode == "POLAR")
+    st.ch_beam_offsets = sel_beam_offsets
+    st.selection_done  = True
+    mode_str = "POLAR" if st.polar_mode else "PHOT"
+    print(f"[monitor] Interactive selection done ({mode_str}) — "
+          f"ref_ids resolved as each channel catalogue is built.")
+
+
+def _resolve_selection(st: MonitorState, ch: int,
+                       cat_xs: np.ndarray, cat_ys: np.ndarray) -> None:
+    """Map interactive-selection pixel coords to ref_ids for channel ch."""
+    coords = st.sel_xy.get(ch, [])
+    if not coords:
+        return
+
+    MATCH_R = 20.0
+
+    def _nearest(x, y):
+        dists = np.hypot(cat_xs - x, cat_ys - y)
+        j = int(np.argmin(dists))
+        return int(j) if dists[j] <= MATCH_R else -1
+
+    if st.polar_mode:
+        beam_map:    dict = {}
+        b0_ids:      list = []
+        all_ref_ids: list = []
+        for pair in coords:
+            (x0, y0), (x1, y1) = pair
+            r0 = _nearest(x0, y0)
+            r1 = _nearest(x1, y1)
+            if r0 >= 0:
+                b0_ids.append(r0);  beam_map[r0] = 0;  all_ref_ids.append(r0)
+            if r1 >= 0 and r1 != r0:
+                beam_map[r1] = 1;  all_ref_ids.append(r1)
+        target_b0 = b0_ids[0] if b0_ids else None
+        comp_b0s  = b0_ids[1:] if len(b0_ids) > 1 else []
+        st.per_ch_target[ch] = target_b0
+        st.per_ch_comps[ch]  = comp_b0s
+        if ch == st.channels[0]:
+            st.target_ref_id = target_b0
+            st.comp_ref_ids  = comp_b0s
+        st.dbs[ch].save_selection(target_b0, all_ref_ids[1:], beam_map=beam_map)
+        boff = st.ch_beam_offsets.get(ch)
+        if boff is not None:
+            st.dbs[ch].save_beam_offset(boff[0], boff[1])
+        print(f"  [ch{ch}] POLAR resolved: target_b0={target_b0}  comps_b0={comp_b0s}")
+    else:
+        resolved   = [_nearest(x, y) for (x, y) in coords]
+        target_idx = resolved[0] if resolved else -1
+        comp_idxs  = [r for r in resolved[1:] if r >= 0]
+        st.per_ch_target[ch] = target_idx if target_idx >= 0 else None
+        st.per_ch_comps[ch]  = comp_idxs
+        if ch == st.channels[0]:
+            st.target_ref_id = st.per_ch_target[ch]
+            st.comp_ref_ids  = st.per_ch_comps[ch]
+        st.dbs[ch].save_selection(st.per_ch_target[ch], st.per_ch_comps[ch])
+        print(f"  [ch{ch}] PHOT resolved: target={st.per_ch_target[ch]}  "
+              f"comps={st.per_ch_comps[ch]}")
+
+
+def _process_one_frame(st: MonitorState, ch: int, filepath: str,
+                       select_sources: bool, n_sources: int,
+                       data_dirs: dict, seq_suffix: str, object_filter,
+                       threshold: float, fwhm_estimate: float,
+                       aperture_radius: float, window_size: int,
+                       platescale: float, save_png: str,
+                       verbose: bool) -> tuple:
+    """Run photometry on one FITS file; update DB and publish via ZMQ."""
+    basename = os.path.basename(filepath)
+    try:
+        result = measure_raw_photometry(
+            filepath, threshold=threshold,
+            fwhm_for_detection=fwhm_estimate,
+            aperture_radius=aperture_radius,
+            window_size=window_size, verbose=verbose,
+        )
+    except Exception as exc:
+        print(f"  [BAD] {basename}: {exc}")
+        st.dbs[ch].insert_bad_frame(filepath, reason=str(exc))
+        return None, None
+
+    if result["n_sources"] == 0:
+        st.dbs[ch].insert_bad_frame(
+            filepath,
+            date_obs=result.get("date_obs", ""),
+            jd=result.get("jd"),
+            object_name=result.get("object_name", ""),
+            reason="no sources detected",
+        )
+        print(f"  [BAD] {basename}: no sources")
+        return None, None
+
+    xs = result["xcentroids"]
+    ys = result["ycentroids"]
+    is_first = not st.matchers[ch].has_reference
+
+    if is_first:
+        st.matchers[ch].set_reference(xs, ys)
+        st.dbs[ch].save_reference_catalogue(xs, ys)
+        ref_ids = np.arange(len(xs), dtype=int)
+        print(f"  [ch{ch}] Reference catalogue: {len(xs)} sources")
+
+        # Selection — triggered on the first channel's first frame only
+        if ch == st.channels[0] and not st.selection_done:
+            if select_sources:
+                _interactive_select(
+                    st, filepath, result,
+                    data_dirs, seq_suffix, object_filter,
+                    threshold, fwhm_estimate, aperture_radius,
+                    window_size, platescale, save_png)
+            else:
+                _auto_select(st, filepath, result, n_sources, save_png)
+
+        # Interactive mode: resolve pixel coords -> ref_ids for this channel
+        if select_sources and st.sel_xy:
+            _resolve_selection(st, ch, xs, ys)
+    else:
+        ref_ids = st.matchers[ch].match(xs, ys)
+        if verbose:
+            print(f"  [ch{ch}] Matched {int((ref_ids>=0).sum())}/{len(xs)} sources")
+
+    # Beam labels for POLAR mode
+    beam_ids_arr = None
+    if st.polar_mode and st.dbs[ch].has_selection():
+        _, _, bm = st.dbs[ch].load_selection()
+        if bm:
+            beam_ids_arr = np.array(
+                [bm.get(int(rid), -1) if rid >= 0 else -1
+                 for rid in ref_ids], dtype=int)
+
+    st.dbs[ch].insert_frame(filepath, result, ref_ids, beam_ids=beam_ids_arr)
+
+    pub_target = st.per_ch_target.get(ch, st.target_ref_id)
+    pub_comps  = st.per_ch_comps.get(ch,  st.comp_ref_ids)
+    boff       = st.ch_beam_offsets.get(ch) if st.polar_mode else None
+    _publish(st.sock, ch, result, ref_ids, platescale,
+             target_id=pub_target, comp_ids=pub_comps,
+             beam_ids=beam_ids_arr, beam_offset=boff)
+
+    fwhm_as = (result["fwhm"] * platescale
+               if np.isfinite(result["fwhm"]) else float("nan"))
+    print(f"  {basename:45s}  "
+          f"{result['n_sources']:3d} src  "
+          f"FWHM={fwhm_as:.2f}\"  "
+          f"peak={np.nanmax(result['max_counts']):.0f}  "
+          f"flux={np.nanmax(result['fluxes']):.0f}")
+    return result, is_first
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_monitor — flat, linear, no nested functions
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_monitor(
@@ -1493,407 +1937,96 @@ def run_monitor(
     fwhm_estimate: float = 5.0,
     window_size: int = 25,
     select_sources: bool = False,
+    n_sources: int = 6,
     watch: bool = False,
     interval: float = 30.0,
     zmq_port: int = ZMQ_DEFAULT_PORT,
     verbose: bool = False,
+    save_png: str = "",
 ) -> None:
-    """Main monitoring and publishing loop.
+    """Main monitoring loop.
 
-    Parameters
-    ----------
-    data_dirs : dict[int, str]
-        Channel number → raw data directory for the night.
-        e.g. {1: "/data/sparc4acs1/today", 2: "/data/sparc4acs2/today"}
-    seq_suffix : str
-        Filename suffix for science frames (e.g. "cr3").
-    object_filter : str, optional
-        Only process files whose FITS OBJECT keyword contains this string.
-    db_dir : str
-        Directory for SQLite files.  Defaults to first channel data dir.
-    platescale : float
-        Arcsec per pixel.
-    threshold : float
-        Detection threshold in units of background σ.
-    fwhm_estimate : float
-        Approximate PSF FWHM in pixels (DAOStarFinder + match radius).
-    window_size : int
-        Cutout half-size for Gaussian FWHM fitting.
-    select_sources : bool
-        If True, open interactive source-selection on the first image.
-    watch : bool
-        If True, keep polling for new files until Ctrl-C.
-    interval : float
-        Seconds between polls in watch mode.
-    zmq_port : int
-        TCP port for the ZeroMQ PUB socket.
-    verbose : bool
-        Print per-image diagnostics.
+    select_sources=False (default): auto-select top n_sources brightest.
+    select_sources=True           : open interactive 4-panel selection window.
     """
-    channels     = sorted(data_dirs.keys())
-    match_radius = fwhm_estimate
+    channels        = sorted(data_dirs.keys())
+    aperture_radius = 3.0 * fwhm_estimate
 
-    # ── Databases and source matchers ──────────────────────────────────────
+    # ── Databases and matchers ────────────────────────────────────────────
     if not db_dir:
         db_dir = data_dirs[channels[0]]
     os.makedirs(db_dir, exist_ok=True)
 
-    dbs:      Dict[int, PhotometryDB]  = {}
-    matchers: Dict[int, SourceMatcher] = {}
+    st = MonitorState(channels)
+
     for ch in channels:
-        db_path      = os.path.join(db_dir, f"monitor_ch{ch}.db")
-        dbs[ch]      = PhotometryDB(db_path)
-        matchers[ch] = SourceMatcher(match_radius=match_radius, verbose=verbose)
-        print(f"[monitor] ch{ch} ({CHANNEL_LABELS[ch]})  db → {db_path}")
+        db_path       = os.path.join(db_dir, f"monitor_ch{ch}.db")
+        st.dbs[ch]    = PhotometryDB(db_path)
+        st.matchers[ch] = SourceMatcher(match_radius=fwhm_estimate, verbose=verbose)
+        print(f"[monitor] ch{ch} ({CHANNEL_LABELS[ch]})  db -> {db_path}")
 
-    # ── Restore each channel's own reference catalogue ────────────────────
+    # ── Restore reference catalogues from previous runs ───────────────────
     for ch in channels:
-        if dbs[ch].has_reference_catalogue():
-            rxs, rys = dbs[ch].load_reference_catalogue()
-            matchers[ch].set_reference(rxs, rys)
-            print(f"[monitor] ch{ch} reference catalogue restored: {len(rxs)} sources")
+        if st.dbs[ch].has_reference_catalogue():
+            rxs, rys = st.dbs[ch].load_reference_catalogue()
+            st.matchers[ch].set_reference(rxs, rys)
+            print(f"[monitor] ch{ch} catalogue restored: {len(rxs)} sources")
 
-    # ── ZeroMQ publisher ──────────────────────────────────────────────────
-    sock = _make_publisher(zmq_port)
-
-    # ── Source selection state ────────────────────────────────────────────
-    # sel_xy[ch] = [(x,y), ...] in click order — pixel coords from the
-    # selection window, channel-specific.  When each channel's reference
-    # catalogue is first established, _resolve_selection_for_channel()
-    # converts these coords to stable ref_ids for that channel.
-    #
-    # target_ref_id / comp_ref_ids  — reference channel's ref_ids
-    # per_ch_target / per_ch_comps  — per-channel ref_ids (set once catalogue is ready)
-    sel_xy:          Dict[int, list]          = {}   # ch -> [(x,y),...] or [((x0,y0),(x1,y1)),...]
-    polar_mode:      bool                     = False
-    ch_beam_offsets: Dict[int, Optional[tuple]] = {ch: None for ch in channels}
-    target_ref_id: Optional[int]            = None
-    comp_ref_ids:  List[int]                = []
-    per_ch_target: Dict[int, Optional[int]] = {ch: None for ch in channels}
-    per_ch_comps:  Dict[int, List[int]]     = {ch: []   for ch in channels}
-    source_selection_done = False
-
-    if dbs[channels[0]].has_selection():
-        target_ref_id, comp_ref_ids, bm0 = dbs[channels[0]].load_selection()
-        source_selection_done = True
-        # Detect polar mode from stored beam_map
+    # ── Restore prior interactive selection (interactive mode only) ───────
+    if select_sources and st.dbs[channels[0]].has_selection():
+        t, c, bm0 = st.dbs[channels[0]].load_selection()
+        st.target_ref_id = t
+        st.comp_ref_ids  = c
+        st.selection_done = True
         if any(v is not None for v in bm0.values()):
-            polar_mode = True
+            st.polar_mode = True
         for ch in channels:
-            if dbs[ch].has_selection():
-                t, c, bm = dbs[ch].load_selection()
-                per_ch_target[ch] = t
-                per_ch_comps[ch]  = c
-            if dbs[ch].has_beam_offset():
-                dx, dy = dbs[ch].load_beam_offset()
-                ch_beam_offsets[ch] = (dx, dy)
-        mode_str = "POLAR" if polar_mode else "PHOT"
-        print(f"[monitor] Selection restored ({mode_str}) — "
-              f"target={target_ref_id}  comps={comp_ref_ids}")
+            if st.dbs[ch].has_selection():
+                tc, cc, _ = st.dbs[ch].load_selection()
+                st.per_ch_target[ch] = tc
+                st.per_ch_comps[ch]  = cc
+            if st.dbs[ch].has_beam_offset():
+                dx, dy = st.dbs[ch].load_beam_offset()
+                st.ch_beam_offsets[ch] = (dx, dy)
+        mode_str = "POLAR" if st.polar_mode else "PHOT"
+        print(f"[monitor] Selection restored ({mode_str}): "
+              f"target={t}  comps={c}")
 
-    def _resolve_selection_for_channel(ch: int,
-                                        cat_xs: np.ndarray,
-                                        cat_ys: np.ndarray) -> None:
-        """Map selection pixel coords to ref_ids in this channel's catalogue.
+    # ── ZeroMQ socket ─────────────────────────────────────────────────────
+    st.sock = _make_publisher(zmq_port)
 
-        Called once per channel when its reference catalogue is first established.
-        Handles both PHOT mode (single coords) and POLAR mode (beam-pair coords).
-
-        In POLAR mode each selected star has two ref_ids (beam 0 and beam 1).
-        The DB selection table stores one row per beam with the beam column set.
-        Only beam-0 ref_ids are used as the canonical target/comp identifiers;
-        beam-1 partners are looked up from the DB at plot time.
-        """
-        nonlocal target_ref_id, comp_ref_ids
-        coords = sel_xy.get(ch, [])
-        if not coords:
-            return
-
-        MATCH_R = 20.0
-
-        def _nearest(x, y):
-            dists = np.hypot(cat_xs - x, cat_ys - y)
-            j = int(np.argmin(dists))
-            return int(j) if dists[j] <= MATCH_R else -1
-
-        if polar_mode:
-            # coords is a list of ((x0,y0),(x1,y1)) pairs
-            beam_map: dict = {}   # ref_id -> beam index
-            b0_ids = []           # beam-0 ref_ids in role order
-            for pair in coords:
-                (x0, y0), (x1, y1) = pair
-                r0 = _nearest(x0, y0)
-                r1 = _nearest(x1, y1)
-                if r0 >= 0:
-                    b0_ids.append(r0)
-                    beam_map[r0] = 0
-                if r1 >= 0 and r1 != r0:
-                    # Store beam-1 as a comp entry just after its beam-0 partner
-                    beam_map[r1] = 1
-
-            target_b0 = b0_ids[0] if b0_ids else None
-            comp_b0s  = b0_ids[1:] if len(b0_ids) > 1 else []
-
-            # Build full ref_id list: target_b0, target_b1, comp1_b0, comp1_b1, ...
-            all_ref_ids = []
-            for pair_idx, pair in enumerate(coords):
-                (x0, y0), (x1, y1) = pair
-                r0 = _nearest(x0, y0)
-                r1 = _nearest(x1, y1)
-                if r0 >= 0:
-                    all_ref_ids.append(r0)
-                if r1 >= 0 and r1 != r0:
-                    all_ref_ids.append(r1)
-
-            per_ch_target[ch] = target_b0
-            per_ch_comps[ch]  = comp_b0s
-
-            if ch == channels[0]:
-                target_ref_id = target_b0
-                comp_ref_ids  = comp_b0s
-
-            # Save selection with beam labels; save beam offset to DB
-            dbs[ch].save_selection(target_b0, all_ref_ids[1:],
-                                   beam_map=beam_map)
-            boff = ch_beam_offsets.get(ch)
-            if boff is not None:
-                dbs[ch].save_beam_offset(boff[0], boff[1])
-
-            print(f"  [ch{ch}] POLAR selection resolved: "
-                  f"target_b0={target_b0}  comps_b0={comp_b0s}  "
-                  f"beam_map={beam_map}")
-        else:
-            # PHOT mode: simple single-coord matching
-            resolved = [_nearest(x, y) for (x, y) in coords]
-            target_idx = resolved[0] if resolved else -1
-            comp_idxs  = [r for r in resolved[1:] if r >= 0]
-
-            per_ch_target[ch] = target_idx if target_idx >= 0 else None
-            per_ch_comps[ch]  = comp_idxs
-
-            if ch == channels[0]:
-                target_ref_id = per_ch_target[ch]
-                comp_ref_ids  = per_ch_comps[ch]
-
-            dbs[ch].save_selection(per_ch_target[ch], per_ch_comps[ch])
-            print(f"  [ch{ch}] PHOT selection resolved: "
-                  f"target={per_ch_target[ch]}  comps={per_ch_comps[ch]}")
-
-    def _try_source_selection(ref_filepath: str, ref_result: dict) -> None:
-        """Open the 4-panel selection window.
-
-        Finds the nearest-in-time file from every other channel and runs
-        photometry on it so all panels are populated simultaneously.
-        """
-        nonlocal source_selection_done, target_ref_id, comp_ref_ids
-        nonlocal per_ch_target, per_ch_comps
-        if not select_sources or source_selection_done:
-            return
-
-        # Build all_channel_data: for each channel find the file whose
-        # observation time is closest to the reference channel's first file
-        ref_jd = ref_result.get("jd", float("nan"))
-        all_channel_data: Dict[int, tuple] = {}
-        for ch in channels:
-            files = find_fits_files(data_dirs[ch], seq_suffix, object_filter)
-            if not files:
-                continue
-            # Find closest JD
-            best_fp, best_dt = None, float("inf")
-            for fp in files:
-                jd = _get_jd_from_header(fp)
-                dt = abs(jd - ref_jd)
-                if dt < best_dt:
-                    best_dt, best_fp = dt, fp
-            if best_fp is None:
-                continue
-            try:
-                res = measure_raw_photometry(
-                    best_fp,
-                    threshold=threshold,
-                    fwhm_for_detection=fwhm_estimate,
-                    aperture_radius=aperture_radius,
-                    window_size=window_size,
-                    verbose=False,
-                )
-                if res["n_sources"] > 0:
-                    all_channel_data[ch] = (best_fp, res)
-                    print(f"  [selection] ch{ch}: {os.path.basename(best_fp)} "
-                          f"(Δt={best_dt*86400:.0f} s,  "
-                          f"{res['n_sources']} sources)")
-            except Exception as exc:
-                print(f"  [warn] ch{ch} selection frame failed: {exc}")
-
-        # Always include the reference channel's data so sel_xy has the
-        # right channel key even when running with only 1 channel.
-        all_channel_data[channels[0]] = (ref_filepath, ref_result)
-        per_ch_sel_xy, sel_inst_mode, sel_beam_offsets =             select_sources_interactive(
-                ref_filepath, ref_result,
-                platescale=platescale,
-                all_channel_data=all_channel_data,
-            )
-        # Store the pixel coordinates; ref_ids will be resolved per-channel
-        # when each channel's reference catalogue is first established.
-        nonlocal sel_xy, polar_mode, ch_beam_offsets
-        sel_xy         = per_ch_sel_xy
-        polar_mode     = (sel_inst_mode == "POLAR")
-        ch_beam_offsets = sel_beam_offsets   # {ch: (dx,dy) or None}
-        source_selection_done = True
-        mode_str = "POLAR" if polar_mode else "PHOT"
-        print(f"[monitor] Selection saved ({mode_str}) — "
-              f"ref_ids resolved as each channel catalogue is built.")
-
-    # ── Processing loop ───────────────────────────────────────────────────
-    aperture_radius = 3.0 * fwhm_estimate
-    print(f"\n[monitor] Aperture  : {aperture_radius:.1f} px")
-    print(f"[monitor] FWHM est. : {fwhm_estimate:.1f} px")
-    print(f"[monitor] Threshold : {threshold} σ")
-    print(f"[monitor] Platescale: {platescale} arcsec/px")
+    # ── Summary ───────────────────────────────────────────────────────────
+    mode_label = "interactive" if select_sources else f"auto (top {n_sources})"
+    print(f"\n[monitor] Mode       : {mode_label}")
+    print(f"[monitor] Aperture   : {aperture_radius:.1f} px")
+    print(f"[monitor] FWHM est.  : {fwhm_estimate:.1f} px")
+    print(f"[monitor] Threshold  : {threshold} sigma")
+    print(f"[monitor] Platescale : {platescale} arcsec/px")
     if object_filter:
-        print(f"[monitor] Object    : {object_filter!r}")
+        print(f"[monitor] Object     : {object_filter!r}")
     print()
 
-    def _process_frame(ch: int, filepath: str):
-        """Run photometry on one FITS file; update DB and publish via ZMQ.
-
-        Each channel is fully independent:
-          - Its own SourceMatcher tracks within-channel guiding drift.
-          - Its own ref_ids (0 = brightest detected star in its first frame,
-            1 = second brightest, …) are local to that channel.
-          - ref_ids are published as-is in the ZMQ message; the plot tools
-            treat each channel independently.
-
-        Note on cross-channel identification
-        -------------------------------------
-        Cross-channel source matching (i.e. ensuring ref_id=N means the same
-        physical star in all four bands) is intentionally NOT implemented here.
-        The four SPARC4 channels can have different exposure times and therefore
-        different cadences, making frame-by-frame alignment unreliable.  A safe
-        cross-channel identification scheme will be added in a future version.
-        For now, the user selects the target and comparisons visually in channel
-        1; the plot tools use the same ref_ids for all channels, which works
-        correctly because SPARC4's inter-channel pixel offset is < 5 px and the
-        per-channel SourceMatcher assigns ref_ids in the same brightness order
-        as channel 1 for the same set of stars.
-        """
-        nonlocal target_ref_id, comp_ref_ids, source_selection_done
-
-        basename = os.path.basename(filepath)
-        try:
-            result = measure_raw_photometry(
-                filepath,
-                threshold=threshold,
-                fwhm_for_detection=fwhm_estimate,
-                aperture_radius=aperture_radius,
-                window_size=window_size,
-                verbose=verbose,
-            )
-        except Exception as exc:
-            print(f"  [BAD] {basename}: {exc}")
-            dbs[ch].insert_bad_frame(filepath, reason=str(exc))
-            return None, None
-
-        if result["n_sources"] == 0:
-            print(f"  [BAD] {basename}: no sources detected — recorded as bad frame.")
-            dbs[ch].insert_bad_frame(
-                filepath,
-                date_obs=result.get("date_obs", ""),
-                jd=result.get("jd"),
-                object_name=result.get("object_name", ""),
-                reason="no sources detected",
-            )
-            return None, None
-
-        xs = result["xcentroids"]
-        ys = result["ycentroids"]
-        is_first = not matchers[ch].has_reference
-
-        if is_first:
-            matchers[ch].set_reference(xs, ys)
-            dbs[ch].save_reference_catalogue(xs, ys)
-            ref_ids = np.arange(len(xs), dtype=int)
-            print(f"  [ch{ch}] Reference catalogue: {len(xs)} sources")
-            # Open source selection on the first good frame of the first channel
-            if ch == channels[0] and not source_selection_done:
-                _try_source_selection(filepath, result)
-            # Once catalogue is set, resolve selection pixel coords → ref_ids
-            if sel_xy:
-                _resolve_selection_for_channel(ch, xs, ys)
-        else:
-            ref_ids = matchers[ch].match(xs, ys)
-            if verbose:
-                print(f"  [ch{ch}] Matched {int((ref_ids>=0).sum())}/{len(xs)} sources")
-
-        # In POLAR mode, assign beam labels to each detection:
-        # beam-0 sources are those whose ref_id is in the beam-0 set for this ch;
-        # beam-1 sources are those in the beam-1 set.
-        # This requires the beam_map from the DB selection.
-        beam_ids_arr = None
-        if polar_mode and dbs[ch].has_selection():
-            _, _, bm = dbs[ch].load_selection()
-            if bm:
-                beam_ids_arr = np.array(
-                    [bm.get(int(rid), -1) if rid >= 0 else -1
-                     for rid in ref_ids], dtype=int)
-
-        dbs[ch].insert_frame(filepath, result, ref_ids, beam_ids=beam_ids_arr)
-
-        pub_target  = per_ch_target.get(ch, target_ref_id)
-        pub_comps   = per_ch_comps.get(ch,  comp_ref_ids)
-        boff        = ch_beam_offsets.get(ch) if polar_mode else None
-        _publish(sock, ch, result, ref_ids, platescale,
-                 target_id=pub_target, comp_ids=pub_comps,
-                 beam_ids=beam_ids_arr, beam_offset=boff)
-
-        fwhm_as = (result["fwhm"] * platescale
-                   if np.isfinite(result["fwhm"]) else float("nan"))
-        print(f"  {basename:45s}  "
-              f"{result['n_sources']:3d} src  "
-              f"FWHM={fwhm_as:.2f}\"  "
-              f"peak={np.nanmax(result['max_counts']):.0f}  "
-              f"flux={np.nanmax(result['fluxes']):.0f}")
-        return result, is_first
-
-    iteration = 0
+    # ── Main polling loop ─────────────────────────────────────────────────
     while True:
-        iteration += 1
         any_new = False
-
-        # ── Process all new files for every channel ────────────────────────
         for ch in channels:
             files     = find_fits_files(data_dirs[ch], seq_suffix, object_filter)
-            new_files = [f for f in files if not dbs[ch].is_processed(f)]
-
-            if not new_files:
-                if verbose:
-                    print(f"[ch{ch}] No new files.")
-                continue
-
-            any_new = True
-            print(f"[ch{ch}] {len(new_files)} new file(s)...")
-
+            new_files = [f for f in files if not st.dbs[ch].is_processed(f)]
+            if new_files:
+                print(f"[ch{ch}] {len(new_files)} new file(s)...")
+                any_new = True
             for filepath in new_files:
-                _process_frame(ch, filepath)
-
+                _process_one_frame(
+                    st, ch, filepath,
+                    select_sources, n_sources,
+                    data_dirs, seq_suffix, object_filter,
+                    threshold, fwhm_estimate, aperture_radius,
+                    window_size, platescale, save_png, verbose)
         if not watch:
             break
-
-        if iteration == 1 and not any_new:
-            print(f"[monitor] Waiting for new files. "
-                  f"Polling every {interval:.0f} s — Ctrl-C to stop.")
-
-        try:
+        if not any_new:
             time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n[monitor] Stopped.")
-            break
 
-    print("[monitor] Done.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     p = argparse.ArgumentParser(
@@ -1927,6 +2060,10 @@ def main() -> None:
     g = p.add_argument_group("Monitor behaviour")
     g.add_argument("--select-sources", action="store_true",
                    help="Open interactive source-selection on the first image")
+    g.add_argument("--n-sources", type=int, default=6,
+                   help="Number of sources to auto-select (target + comps) [default: 6]")
+    g.add_argument("--save-png", default="",
+                   help="Directory to save PNGs for dashboard")
     g.add_argument("--watch", action="store_true",
                    help="Keep watching for new files (poll loop)")
     g.add_argument("--interval", type=float, default=30.0, metavar="SEC",
@@ -1969,7 +2106,9 @@ def main() -> None:
         fwhm_estimate=opts.fwhm,
         window_size=opts.window,
         select_sources=opts.select_sources,
+        n_sources=opts.n_sources,
         watch=opts.watch,
+        save_png=getattr(opts, "save_png", ""),
         interval=opts.interval,
         zmq_port=opts.port,
         verbose=opts.verbose,
